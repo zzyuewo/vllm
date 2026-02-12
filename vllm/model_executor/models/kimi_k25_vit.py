@@ -16,6 +16,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_npu
+import threading
+from functools import lru_cache
 from transformers.activations import GELUActivation
 
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
@@ -72,6 +75,22 @@ def get_rope_shape(org, interpolation_mode, shape):
         .flatten(end_dim=1)
     )
 
+
+def apply_rope_npu(xq, xk, freqs_cis):
+    _apply_rope_input_validation(xq, freqs_cis)
+    _apply_rope_input_validation(xk, freqs_cis)
+    
+    xq = xq.unsqueeze(0)  # (1, S, H, D)
+    xk = xk.unsqueeze(0)
+
+    cos = torch.cat([freqs_cis.real, freqs_cis.real], dim=-1).to(xq.dtype)
+    sin = torch.cat([freqs_cis.imag, freqs_cis.imag], dim=-1).to(xq.dtype)
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+
+    xq_out = torch_npu.npu_rotary_mul(xq, cos, sin).squeeze(0)
+    xk_out = torch_npu.npu_rotary_mul(xk, cos, sin).squeeze(0)
+    return xq_out, xk_out
 
 def apply_rope(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
@@ -183,6 +202,66 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
         out = x + torch.cat(pos_embs)
         return out
 
+class AscendMoonVision3dPatchEmbed(nn.Module):
+    """3D patch embedding for vision tower. 昇腾NPU适配版，纯手动实现Conv2d"""
+
+    def __init__(
+        self,
+        out_dim: int,
+        in_dim: int = 3,
+        patch_size: int | tuple[int, int] = (14, 14),
+        pos_emb_height: int = 14,
+        pos_emb_width: int = 14,
+        pos_emb_time: int = 4,
+        pos_emb_type: str = "divided_fixed",
+    ):
+        super().__init__()
+        assert isinstance(patch_size, int | Sequence), (
+            f"Invalid patch_size type: {type(patch_size)}"
+        )
+        if isinstance(patch_size, int):
+            patch_size = (patch_size, patch_size)
+        assert len(patch_size) == 2, (
+            f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        )
+        self.patch_size = patch_size  # (ph, pw)
+        self.out_dim = out_dim
+        self.in_dim = in_dim
+
+        # 保留原Conv2d层（仅复用权重/偏置参数，不调用其forward）
+        self.proj = nn.Conv2d(
+            in_dim, out_dim, kernel_size=patch_size, stride=patch_size
+        )
+
+        # 位置编码与原代码完全一致，无修改
+        if pos_emb_type == "divided_fixed":
+            self.pos_emb = Learnable2DInterpPosEmbDivided_fixed(
+                height=pos_emb_height,
+                width=pos_emb_width,
+                num_frames=pos_emb_time,
+                dim=out_dim,
+            )
+        else:
+            raise NotImplementedError(f"Not support pos_emb_type: {pos_emb_type}")
+
+    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+
+        ph, pw = self.patch_size  # patch高度、宽度
+        B, C, H, W = x.shape      # 输入维度：批次、通道、高、宽
+        nH = H // ph
+        nW = W // pw
+
+        patch_x = x.view(B, C, nH, ph, nW, pw)
+        patch_x = patch_x.permute(0, 2, 4, 1, 3, 5)
+        patch_x = patch_x.reshape(B, nH * nW, C * ph * pw)
+        conv_weight = self.proj.weight.data.view(self.out_dim, -1)
+        x_proj = patch_x.matmul(conv_weight.transpose(0, 1))
+
+
+        x = x_proj.view(x.size(0), -1)
+        x = self.pos_emb(x, grid_thws)
+
+        return x
 
 class MoonVision3dPatchEmbed(nn.Module):
     """3D patch embedding for vision tower."""
@@ -239,6 +318,16 @@ class Rope2DPosEmbRepeated(nn.Module):
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
+        self._cache_max_size = 128  # 新增：缓存最大条目数
+        self._cache_access_order = []  # 新增：记录访问顺序，用于LRU
+
+        self.register_buffer(
+            "freqs_cis", 
+            self._precompute_freqs_cis(torch.device('cpu')), 
+            persistent=False
+        )
+        self._cached_cos_sin = {}
+        self._lock = threading.Lock()  # 线程安全锁
 
     def extra_repr(self):
         return (
@@ -278,10 +367,10 @@ class Rope2DPosEmbRepeated(nn.Module):
         Returns:
             freqs_cis: tensor of shape (sum(t * height * width), dim//2)
         """
-        if not hasattr(self, "freqs_cis"):
-            self.register_buffer(
-                "freqs_cis", self._precompute_freqs_cis(device), persistent=False
-            )
+        # if not hasattr(self, "freqs_cis"):
+        #     self.register_buffer(
+        #         "freqs_cis", self._precompute_freqs_cis(device), persistent=False
+        #     )
 
         shapes = grid_thws.tolist()
         assert all(
@@ -299,7 +388,34 @@ class Rope2DPosEmbRepeated(nn.Module):
             dim=0,
         )
         return freqs_cis
+    
+    def _evict_lru_cache(self):
+        while len(self._cached_cos_sin) > self._cache_max_size:
+            lru_key = self._cache_access_order.pop(0)
+            if lru_key in self._cached_cos_sin:
+                del self._cached_cos_sin[lru_key]
 
+    def get_cached_cos_sin_for_shapes(
+        self, grid_thws: torch.Tensor, dtype: torch.dtype, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shapes_tuple = tuple(tuple(map(int, row)) for row in grid_thws.tolist())
+        cache_key = (shapes_tuple, dtype, device)
+        
+        with self._lock:
+            if cache_key in self._cache_access_order:
+                self._cache_access_order.remove(cache_key)
+            self._cache_access_order.append(cache_key)
+
+            if cache_key not in self._cached_cos_sin:
+                freqs_cis = self.get_freqs_cis(grid_thws, device).to(torch.complex64)
+                cos = torch.cat([freqs_cis.real, freqs_cis.real], dim=-1).to(dtype)
+                sin = torch.cat([freqs_cis.imag, freqs_cis.imag], dim=-1).to(dtype)
+                cos = cos.unsqueeze(0).unsqueeze(2)
+                sin = sin.unsqueeze(0).unsqueeze(2)
+                self._cached_cos_sin[cache_key] = (cos, sin)
+                self._evict_lru_cache()
+        
+        return self._cached_cos_sin[cache_key]
 
 class MLP2(nn.Module):
     """Two-layer MLP with tensor parallel support."""
@@ -403,6 +519,7 @@ class MoonViTEncoderLayer(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         rope_freqs_cis: torch.Tensor | None = None,
+        cached_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,  # 新增参数
     ):
         """Compute self-attention with packed QKV.
 
@@ -422,7 +539,14 @@ class MoonViTEncoderLayer(nn.Module):
         xqkv = xqkv.view(*qkv_shape)
         xq, xk, xv = torch.unbind(xqkv, dim=-3)
 
-        xq, xk = apply_rope(xq, xk, rope_freqs_cis)
+        # xq, xk = apply_rope(xq, xk, rope_freqs_cis)
+        # 使用缓存的 cos/sin 或计算新的
+        if cached_cos_sin is not None:
+            cos, sin = cached_cos_sin
+            xq = torch_npu.npu_rotary_mul(xq.unsqueeze(0), cos, sin).squeeze(0)
+            xk = torch_npu.npu_rotary_mul(xk.unsqueeze(0), cos, sin).squeeze(0)
+        else:
+            xq, xk = apply_rope_npu(xq, xk, rope_freqs_cis)
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         attn_out = self.attn(
@@ -445,12 +569,13 @@ class MoonViTEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         rope_freqs_cis: torch.Tensor | None = None,
+        cached_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,  # 新增参数
     ):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
         hidden_states = self.attention_qkvpacked(
-            hidden_states, cu_seqlens, rope_freqs_cis
+            hidden_states, cu_seqlens, rope_freqs_cis, cached_cos_sin=cached_cos_sin
         )
         hidden_states = residual + hidden_states
 
@@ -504,6 +629,16 @@ class MoonViT3dEncoder(nn.Module):
             grid_thws=grid_thws, device=hidden_states.device
         )
 
+        rope_freqs_cis = rope_freqs_cis.to(torch.complex64)
+        cached_cos_sin = None
+        try:
+            cached_cos_sin = self.rope_2d.get_cached_cos_sin_for_shapes(
+                grid_thws, hidden_states.dtype, hidden_states.device
+            )
+        except Exception as e:
+            logger.warning(f"Cache miss/failure for cos/sin: {e}, falling back to original method")
+            cached_cos_sin = None
+
         lengths = torch.cat(
             (
                 torch.zeros(1, dtype=grid_thws.dtype, device=grid_thws.device),
@@ -515,7 +650,10 @@ class MoonViT3dEncoder(nn.Module):
 
         for block in self.blocks:
             hidden_states = block(
-                hidden_states, cu_seqlens, rope_freqs_cis=rope_freqs_cis
+                hidden_states,
+                cu_seqlens,
+                rope_freqs_cis=rope_freqs_cis,
+                cached_cos_sin=cached_cos_sin
             )
 
         hidden_states = self.final_layernorm(hidden_states)
