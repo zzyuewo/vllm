@@ -184,6 +184,71 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
         return out
 
 
+class AscendMoonVision3dPatchEmbed(nn.Module):
+    """3D patch embedding for vision tower. 昇腾NPU适配版，纯手动实现Conv2d"""
+
+    def __init__(
+            self,
+            out_dim: int,
+            in_dim: int = 3,
+            patch_size: int | tuple[int, int] = (14, 14),
+            pos_emb_height: int = 14,
+            pos_emb_width: int = 14,
+            pos_emb_time: int = 4,
+            pos_emb_type: str = "divided_fixed",
+    ):
+        super().__init__()
+        assert isinstance(patch_size, int | Sequence), (
+            f"Invalid patch_size type: {type(patch_size)}"
+        )
+        if isinstance(patch_size, int):
+            patch_size = (patch_size, patch_size)
+        assert len(patch_size) == 2, (
+            f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        )
+        self.patch_size = patch_size  # (ph, pw)
+        self.out_dim = out_dim
+        self.in_dim = in_dim
+
+        self.proj = nn.Conv2d(
+            in_dim, out_dim, kernel_size=patch_size, stride=patch_size
+        )
+
+        if pos_emb_type == "divided_fixed":
+            self.pos_emb = Learnable2DInterpPosEmbDivided_fixed(
+                height=pos_emb_height,
+                width=pos_emb_width,
+                num_frames=pos_emb_time,
+                dim=out_dim,
+            )
+        else:
+            raise NotImplementedError(f"Not support pos_emb_type: {pos_emb_type}")
+
+    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+        ph, pw = self.patch_size
+        B, C, H, W = x.shape
+
+        nH = H // ph
+        nW = W // pw
+
+        patch_x = x.view(B, C, nH, ph, nW, pw)
+        patch_x = patch_x.permute(0, 2, 4, 1, 3, 5)
+
+        patch_x = patch_x.reshape(B, nH * nW, C * ph * pw)
+
+        conv_weight = self.proj.weight.view(self.out_dim, -1)
+
+        x_proj = torch.matmul(patch_x, conv_weight.t())
+
+        if self.proj.bias is not None:
+            x_proj = x_proj + self.proj.bias.unsqueeze(0).unsqueeze(0)
+
+        x = x_proj.reshape(B, -1)
+
+        x = self.pos_emb(x, grid_thws)
+
+        return x
+
 class MoonVision3dPatchEmbed(nn.Module):
     """3D patch embedding for vision tower."""
 
@@ -566,7 +631,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         self.patch_size = config.patch_size
         self.merge_type = config.merge_type
 
-        self.patch_embed = MoonVision3dPatchEmbed(
+        self.patch_embed = AscendMoonVision3dPatchEmbed(
             out_dim=config.hidden_size,
             patch_size=config.patch_size,
             pos_emb_height=config.init_pos_emb_height,
